@@ -14,7 +14,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Requirements**: Windows 10/11 and Google Chrome installed natively for headless debugging injection.
+> **Requirements**: Windows 10/11 with Google Chrome or Microsoft Edge installed for debugging injection.
 
 MeshyDownloader provides a desktop GUI that intercepts decrypted 3D model data directly inside the browser's web worker in real time, extracting clean `.glb` files from public Meshy.ai links without requiring browser DevTools inspection.
 
@@ -33,7 +33,7 @@ python meshy_downloader.py
 ## Limitations
 
 - **Platform**: Tested and optimized for Windows 10/11.
-- **Browser**: Requires native Google Chrome for remote debugging injection.
+- **Browser**: Requires native Google Chrome or Microsoft Edge for remote debugging injection.
 
 ## License
 

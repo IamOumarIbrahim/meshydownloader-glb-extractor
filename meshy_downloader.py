@@ -13,6 +13,7 @@ import threading
 import queue
 import subprocess
 import urllib.request
+import socket
 import websockets
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -375,15 +376,64 @@ class MeshyDownloaderApp:
         except Exception as e:
             self.log_queue.put(('log', f"  (debug HTML dump failed: {e})\n"))
 
+    @staticmethod
+    def _find_browser() -> str:
+        candidates = []
+        # 1. Check Windows Registry App Paths
+        try:
+            import winreg
+            for app in ("chrome.exe", "msedge.exe"):
+                for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                    try:
+                        with winreg.OpenKey(root, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{app}") as k:
+                            val, _ = winreg.QueryValueEx(k, "")
+                            if val and os.path.isfile(val):
+                                candidates.append(val)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+        # 2. Standard filesystem paths
+        candidates.extend([
+            # Google Chrome
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            shutil.which("chrome"),
+            shutil.which("google-chrome"),
+            # Microsoft Edge (Chromium-based, preinstalled on Windows 10/11)
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            shutil.which("msedge"),
+        ])
+
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return os.path.abspath(path)
+        return None
+
+    @staticmethod
+    def _get_free_port() -> int:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', 0))
+                return s.getsockname()[1]
+        except Exception:
+            return 9222
+
     async def _download(self, url: str, save_dir: str):
-        chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-        if not os.path.exists(chrome_path):
+        browser_path = self._find_browser()
+        if not browser_path:
             raise FileNotFoundError(
-                "Chrome not found at C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+                "Neither Google Chrome nor Microsoft Edge was found on this system.\n"
+                "Please install Google Chrome or Microsoft Edge to continue."
             )
 
-        self.log_queue.put(('status', "Launching Chrome (anti-detect, off-screen)…"))
-        self.tmp_profile = tempfile.mkdtemp(prefix="meshy_chrome_")
+        browser_name = "Edge" if "msedge.exe" in browser_path.lower() else "Chrome"
+        port = self._get_free_port()
+        self.log_queue.put(('status', f"Launching {browser_name} (anti-detect, port {port})…"))
+        self.tmp_profile = tempfile.mkdtemp(prefix="meshy_browser_")
 
         # ── FIX 1: NO --headless flag ──────────────────────────────────────────
         #   --headless=new fingerprints Chrome as a bot; Meshy blocks all API
@@ -392,13 +442,12 @@ class MeshyDownloaderApp:
         #   Instead, open a real (but off-screen) window with --window-position.
         #
         # ── FIX 2: Anti-detection flags ───────────────────────────────────────
-        #   --disable-blink-features=AutomationControlled   removes the
+        #   --disable-blink-features=AutomationControlled removes the
         #   navigator.webdriver=true override Chrome adds when DevTools is active.
         # ──────────────────────────────────────────────────────────────────────
         self.chrome_proc = subprocess.Popen([
-            chrome_path,
-            "--remote-debugging-port=9222",
-            "--no-sandbox",
+            browser_path,
+            f"--remote-debugging-port={port}",
             "--disable-gpu",
             "--disable-blink-features=AutomationControlled",   # FIX 2
             f"--user-agent={USER_AGENT}",
@@ -412,34 +461,57 @@ class MeshyDownloaderApp:
             #   Windows' native window-occlusion tracking marks an off-screen window
             #   as "occluded," which throttles requestAnimationFrame and pauses any
             #   WebGL/Three.js render loop — exactly the loop that triggers GLB
-            #   decryption in Meshy's viewer. Without these flags the page loads and
-            #   all network calls succeed, but the 3D viewer's JS never actually runs,
-            #   so the decrypt worker is never created at all.
+            #   decryption in Meshy's viewer.
             "--disable-features=CalculateNativeWinOcclusion",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-background-timer-throttling",
             f"--user-data-dir={self.tmp_profile}",
-        ])
+            "about:blank",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         # ── FIX 3: Retry loop instead of bare sleep(3) ────────────────────────
         ws_url = None
-        for _attempt in range(20):
-            await asyncio.sleep(1)
-            if self.chrome_proc.poll() is not None:
-                raise RuntimeError("Chrome exited immediately — check installation.")
+        for _attempt in range(25):
+            await asyncio.sleep(0.8)
+            # Try contacting the DevTools endpoint first
             try:
-                with urllib.request.urlopen("http://localhost:9222/json", timeout=2) as r:
-                    targets = json.loads(r.read())
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=1.5) as r:
+                    targets = json.loads(r.read().decode('utf-8'))
                 pages = [t for t in targets if t.get("type") == "page"]
-                if pages:
+                if pages and "webSocketDebuggerUrl" in pages[0]:
                     ws_url = pages[0]["webSocketDebuggerUrl"]
                     break
             except Exception:
                 pass
 
+            # If DevTools not yet responding, verify process is still alive
+            if self.chrome_proc.poll() is not None:
+                # One last attempt to read endpoint in case of parent process handoff
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=1.5) as r:
+                        targets = json.loads(r.read().decode('utf-8'))
+                    pages = [t for t in targets if t.get("type") == "page"]
+                    if pages and "webSocketDebuggerUrl" in pages[0]:
+                        ws_url = pages[0]["webSocketDebuggerUrl"]
+                        break
+                except Exception:
+                    pass
+
+                exit_code = self.chrome_proc.poll()
+                stderr_text = ""
+                try:
+                    if self.chrome_proc.stderr:
+                        stderr_text = self.chrome_proc.stderr.read().decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    pass
+                err_msg = f"{browser_name} exited immediately (exit code {exit_code})."
+                if stderr_text:
+                    err_msg += f" Details: {stderr_text[:300]}"
+                raise RuntimeError(err_msg)
+
         if not ws_url:
-            raise RuntimeError("Could not connect to Chrome DevTools after 20 s.")
+            raise RuntimeError(f"Could not connect to {browser_name} DevTools on port {port} after 20 s.")
         self.log_queue.put(('status', "DevTools connected."))
 
         async with websockets.connect(ws_url, max_size=None) as ws:
@@ -467,8 +539,9 @@ class MeshyDownloaderApp:
             for attempt in range(60):
                 await asyncio.sleep(2)
 
-                if self.chrome_proc.poll() is not None:
-                    raise RuntimeError("Chrome died unexpectedly.")
+                if self.chrome_proc.poll() is not None and getattr(ws, "closed", False):
+                    exit_code = self.chrome_proc.poll()
+                    raise RuntimeError(f"{browser_name} terminated unexpectedly (exit code {exit_code}).")
 
                 eval_id = 100 + attempt
                 await ws.send(json.dumps({
